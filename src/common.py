@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM = ROOT / '.deps/sdar'
 WORLD_SIZE = 4
+MIN_GPU_MEMORY_BYTES = 36 * 1024**3
 
 
 def load(name):
@@ -38,6 +39,17 @@ def devices(spec):
     if len(ids) != WORLD_SIZE or len(set(ids)) != WORLD_SIZE or any(not x.isdigit() for x in ids):
         raise ValueError('Choose four distinct allocated GPU indices, e.g. 0,1,2,3')
     return ids
+
+
+def validate_gpu_memory(memory_sizes):
+    """Accept nominal 40GB devices, allowing for CUDA-reported capacity."""
+    if len(memory_sizes) != WORLD_SIZE:
+        raise RuntimeError('Four allocated CUDA devices are required')
+    for index, total_memory in enumerate(memory_sizes):
+        if total_memory < MIN_GPU_MEMORY_BYTES:
+            raise RuntimeError(
+                f'GPU {index} has {total_memory / 1024**3:.1f} GiB; '
+                'this recipe targets four A100 40GB-class GPUs (at least 36 GiB each)')
 
 
 def tasks(assets=None):

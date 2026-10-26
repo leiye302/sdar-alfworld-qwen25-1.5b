@@ -50,6 +50,15 @@ def test_native_scheduler_cpu_budget():
 
 def test_scientific_recipe_is_unchanged():
     cfg = json.loads((ROOT/"configs/experiment.json").read_text(encoding="utf-8"))
+    # Restore exactly the three documented 40GB microbatch changes before
+    # comparing the frozen scientific recipe; do not silently relax the hash.
+    for key in (
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu",
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu",
+        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu",
+    ):
+        assert cfg[key] == 8
+        cfg[key] = 32
     runtime_fields = ('env.resources_per_worker.num_cpus', 'env.alfworld.worker_pool_size', 'actor_rollout_ref.rollout.tensor_model_parallel_size', 'actor_rollout_ref.rollout.gpu_memory_utilization', 'actor_rollout_ref.rollout.enforce_eager', 'actor_rollout_ref.rollout.free_cache_engine', 'actor_rollout_ref.model.use_fused_kernels', 'actor_rollout_ref.model.fused_kernel_options.impl_backend')
     for key in runtime_fields:
         cfg.pop(key, None)

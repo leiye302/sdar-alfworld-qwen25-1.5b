@@ -1,8 +1,8 @@
-# SDAR on ALFWorld — Qwen2.5-1.5B, 4×A100 80GB
+# SDAR on ALFWorld — Qwen2.5-1.5B, 4×A100 40GB
 
 独立的 **Qwen2.5-1.5B-Instruct SDAR** 仓库，直接复用 [官方 SDAR](https://github.com/ZJU-REAL/SDAR) 的 GRPO＋门控自蒸馏实现，源码固定为 `29dcb12a55d8fc17ba6ae03fd0a69048f43051f3`。
 
-从原八卡发布 `e8d323f2da95305c735ebfbae482f57b38ac6898` 拆出。本仓库只跑 1.5b，使用完整 **4×A100 80GB**。只调整 GPU/Ray/FSDP 的四卡资源绑定、默认CPU预算和本尺寸启动入口；**不改上游算法、Teacher、skill、loss、全局采样量、训练步数和评测集**。原八卡仓库保持不动。
+从原八卡发布 `e8d323f2da95305c735ebfbae482f57b38ac6898` 拆出。本仓库只跑 1.5b，当前默认配方面向 **4×A100 40GB**（80GB也可使用）。只调整 GPU/Ray/FSDP 的四卡资源绑定、默认CPU预算、本尺寸启动入口，以及40GB所需的每卡微批量；**不改上游算法、Teacher、skill、loss公式、全局采样量、训练步数和评测集**。原八卡和其他尺寸仓库保持不动。
 
 ## 1. 固定方法与四卡配方
 
@@ -16,7 +16,8 @@
 | GPU | 4个FSDP rank；TP=2，即2个生成副本 |
 | 全局采样 | 每update 16任务×8轨迹=128条episode，不随卡数改变 |
 | 训练 | 150 updates，LR=1e-6，PPO epoch1，原生token-mean |
-| PPO batch | 全局决策行mini-batch256；每卡micro-batch32 |
+| PPO batch | 全局决策行mini-batch256；每卡micro-batch8，原生梯度累积 |
+| 评分微批量 | Student/Teacher及Reference的log-prob每卡micro-batch8 |
 | 其他原生项 | reference KL=0.01 low_var_kl；entropy=0.001；非法动作惩罚=0.1 |
 | 交互 | max steps50、history2、prompt2048、response512 |
 | 采样 | 训练temperature1；验证temperature0.4；top_p1、top_k=-1 |
@@ -29,11 +30,17 @@ Student只看到正常交互历史。Teacher用静态skill对Student已采样的
 g_t=\operatorname{sg}\!\left[\sigma\!\left(5(\log\pi_T(y_t)-\log\pi_S(y_t))\right)\right].
 \]
 
-四卡下配置的256行全局mini-batch对应每rank64行，micro32，由原生梯度累积补齐；八卡下是每rank32行。保留原生按实际决策行数调整批量的逻辑，不额外改写loss归一化；不同GPU拓扑不承诺逐位数值一致。精确配方见 [experiment.json](configs/experiment.json)，方法与适配边界见 [复现合同](docs/REPRODUCTION.md)。
+四卡下配置的256行全局mini-batch对应每rank64行，micro8时由原生梯度累积8次补齐：
+
+\[
+B_{\mathrm{mini}}=4\times8\times8=256.
+\]
+
+相较此前80GB配方，仅将训练、Actor评分、Reference评分这三个每卡micro字段从32改为8。Teacher复用Actor评分的微批量设置。保留原生按实际决策行数调整批量和token-mean聚合的逻辑，不改写loss归一化；微批分组和浮点运算顺序变化，不承诺与80GB配方逐位数值一致。精确配方见 [experiment.json](configs/experiment.json)，方法与适配边界见 [复现合同](docs/REPRODUCTION.md)。
 
 ## 2. 干净服务器安装
 
-需要Linux、Python3.12、兼容CUDA12.8的驱动、四张已获配 **A100 80GB**；默认32个可用逻辑CPU，建议256GiB或更多主机内存。此配方不是A100 40GB配方。提前给模型、原生续训状态和导出留足空间。
+需要Linux、Python3.12、兼容CUDA12.8的驱动、四张已获配且空闲的 **A100 40GB或80GB**；默认32个可用逻辑CPU，建议256GiB或更多主机内存。容量预检要求每卡至少36GiB，以兼容40GB卡的CUDA可见容量；这不是空闲显存保证，也不表示24/32GB卡受支持。提前给模型、原生续训状态和导出留足空间。
 
 ```bash
 git clone https://github.com/leiye302/sdar-alfworld-qwen25-1.5b.git
@@ -81,6 +88,8 @@ bash scripts/train.sh --resume
 
 **不能用原八卡完整断点直接续跑本四卡配方。** 续跑必须匹配模型、配方、任务清单和world_size=4，四rank的model/optimizer/extra_state及data.pt齐全。TextWorld环境迭代器不在原生断点内，不承诺中断前后轨迹逐位一致。
 
+旧四卡80GB配方的配置SHA也不同，不要更新运行中任务或绕过绑定校验强行续跑。新实验使用空的输出目录；同一份40GB配方创建的完整四rank断点才可按上述方式续跑。
+
 ## 4. 同一评测集与结果
 
 固定 [seen140_tasks.json](configs/seen140_tasks.json)：valid_seen的140个唯一任务，seed=2026+i，max steps50、history2、response512、temperature0.4。与原对比仓库使用相同任务和生成预算；不是官方128条验证的原样复现。
@@ -97,7 +106,7 @@ python src/report.py
 
 本次四卡拆分继续使用原生SDAR保存/保留逻辑，不复制GRPO仓库的事务式保存改造。max_keep=2是原生保留参数，不承诺异常中断或跨进程续跑后磁盘恰好只有两份；续跑前应检查实际目录及完整性。续训文件、最终HF导出及存盘中间峰值都计入磁盘预算。
 
-12份核心文件及整个小补丁有SHA锁。CPU检查覆盖原生SDAR梯度、Teacher detach、四卡资源/批量、八卡断点拒绝、固定seen140、原生环境并发和shell入口；GitHub Actions从干净Linux检出公开准备上游。**尚未在4×A100上运行正式训练或NCCL/vLLM/FSDP恢复验收，不提供预填成绩。** 首次真机须确认真实环境交互、Teacher/gate/loss/梯度有限、参数更新及完整存盘。
+12份核心文件及整个小补丁有SHA锁。CPU检查覆盖原生SDAR梯度、Teacher detach、40GB容量预检、四卡资源/批量、八卡断点拒绝、固定seen140、原生环境并发和shell入口；GitHub Actions从干净Linux检出公开准备上游。**40GB配方尚未在真机完成CUDA/NCCL/vLLM训练与FSDP恢复验收，不提供预填成绩或无OOM保证。** 首次真机须确认初始验证、真实环境交互、Teacher/gate/loss/梯度有限、参数更新，并在优化器状态首次建立后继续确认显存及存盘。
 
 包装代码/框架采用Apache-2.0，模型按自身许可使用（1.5B为Apache-2.0，3B为Qwen Research License）。详见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
@@ -106,3 +115,7 @@ python src/report.py
 撤回额外添加的串行环境分组，恢复官方每环境一个 Ray actor、每 actor 0.1 CPU。模型尺寸、获配卡数、训练量、loss、固定 seen140、验证频率和已约定的断点规则不变。未改写上游 rollout、Teacher 或优化器。
 
 已有 checkout 的旧 `.deps/sdar` 仍带旧补丁：在训练停止并保留断点后，将它改名备份，再运行 `python src/setup.py --framework`；或在新的目录重新克隆。不要删除 `runs/`，也不要在运行中的任务里替换依赖。旧配方与新配方的绑定 SHA 不同，禁止绕过恢复校验直接续跑。此更正通过 CPU/干净检出检查不等于已完成 A100 CUDA/NCCL/vLLM 实测。
+
+## 2026-10-26 A100 40GB适配
+
+相对上一四卡提交 `9d1103d`，experiment.json只改三个每卡micro字段：32→8；容量检查从80GB档放宽至40GB档。TP=2、vLLM显存比例0.6、CUDA graph、cache设置、梯度检查点、Actor/优化器offload、上游源码补丁与所有科学设置保持原样。没有为了小显存缩短序列、减少轨迹、关闭Teacher或改变门控。

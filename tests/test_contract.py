@@ -11,7 +11,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
-from common import WORLD_SIZE, checkpoint_complete, devices, load, protocol, tasks
+from common import WORLD_SIZE, checkpoint_complete, devices, load, protocol, tasks, validate_gpu_memory
 from fixed_validation import fixed_validation_envs
 from run import config
 from setup import verify
@@ -60,6 +60,22 @@ def test_four_gpu_allocation():
     assert WORLD_SIZE == 4
     assert devices('0,1,2,3') == [str(i) for i in range(4)]
     assert devices('4,5,6,7') == [str(i) for i in range(4, 8)]
+
+
+@pytest.mark.parametrize('capacity', [39 * 1024**3, 40 * 1024**3, 80 * 1024**3])
+def test_40gb_and_larger_devices_are_accepted(capacity):
+    validate_gpu_memory([capacity] * WORLD_SIZE)
+
+
+@pytest.mark.parametrize('capacities', [
+    [40 * 1024**3] * 3,
+    [40 * 1024**3] * 8,
+    [24 * 1024**3] * 4,
+    [40 * 1024**3] * 3 + [32 * 1024**3],
+])
+def test_insufficient_or_wrong_count_devices_are_rejected(capacities):
+    with pytest.raises(RuntimeError):
+        validate_gpu_memory(capacities)
 
 
 def test_partial_checkpoint_rejected(tmp_path):
@@ -186,8 +202,8 @@ def test_models_share_all_scientific_settings(tmp_path):
     assert OmegaConf.to_container(left, resolve=True) == OmegaConf.to_container(right, resolve=True)
 
 
-def test_scientific_settings_match_official_3b_launcher_except_gpu_count(tmp_path):
-    """Only GPU topology differs; native loss and global batches stay fixed."""
+def test_scientific_settings_match_official_launcher_except_hardware_microbatches(tmp_path):
+    """Only the three per-device microbatches differ in this source comparison."""
     from omegaconf import OmegaConf
     source = (ROOT/'.deps/sdar/examples/sdar_trainer/run_alfworld_3b.sh').read_text()
     assignments = dict(re.findall(r'(?m)^\s*\+?([\w.]+)=([^\s\\]+)', source))
@@ -236,7 +252,15 @@ def test_scientific_settings_match_official_3b_launcher_except_gpu_count(tmp_pat
                 expected = float(raw)
             except ValueError:
                 expected = raw
-        assert OmegaConf.select(cfg, key) == expected, key
+        actual = OmegaConf.select(cfg, key)
+        if key in {
+            'actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu',
+            'actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu',
+            'actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu',
+        }:
+            assert expected == 32 and actual == 8, key
+        else:
+            assert actual == expected, key
 
 
 def test_eight_rank_checkpoint_is_not_a_four_rank_resume(tmp_path):
@@ -263,11 +287,18 @@ def test_runtime_directory_config_can_be_set_before_ray_start(tmp_path):
     assert cfg.ray_init._temp_dir == str(tmp_path/'ray')
 
 
-def test_recipe_differs_from_eight_gpu_release_only_in_gpu_count():
+def test_recipe_differs_from_original_only_in_documented_hardware_and_environment_scheduling():
     recipe = load('experiment.json')
     assert recipe.pop('trainer.n_gpus_per_node') == 4
     assert recipe['env.resources_per_worker.num_cpus'] == 0.1
     assert 'env.alfworld.worker_pool_size' not in recipe
+    for key in (
+        'actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu',
+        'actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu',
+        'actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu',
+    ):
+        assert recipe[key] == 8
+        recipe[key] = 32
     # Reconstruct only the removed runtime grouping to check the original scientific recipe.
     recipe['env.resources_per_worker.num_cpus'] = 1
     recipe['env.alfworld.worker_pool_size'] = 16
@@ -292,7 +323,7 @@ def test_native_gradient_accumulation_preserves_global_batch_on_four_gpus(tmp_pa
         micro = worker.config.actor.ppo_micro_batch_size_per_gpu
         assert ranks * local == cfg.actor_rollout_ref.actor.ppo_mini_batch_size
         results[ranks] = (local, micro, local // micro)
-    assert results == {4: (64, 32, 2), 8: (32, 32, 1)}
+    assert results == {4: (64, 8, 8), 8: (32, 8, 4)}
 
 
 def test_release_allowlist_and_privacy():

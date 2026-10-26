@@ -1,4 +1,4 @@
-# Reproduction contract: official SDAR, ALFWorld, four A100 GPUs
+# Reproduction contract: official SDAR, ALFWorld, four A100 40GB GPUs
 
 ## Algorithm identity
 
@@ -44,7 +44,8 @@ it does not reverse it. Native masks and aggregation are unchanged.
 | Updates | 150 per size |
 | Per update | 16 task groups, eight episodes per group: 128 episodes globally |
 | Learning rate | 1e-6 |
-| PPO mini/micro batch | Global decision-row mini-batch 256, per-GPU micro-batch 32 |
+| PPO mini/micro batch | Global decision-row mini-batch 256, per-GPU micro-batch 8 |
+| Log-prob micro batch | Actor (Student/Teacher) and reference: 8 per GPU |
 | PPO epochs / aggregation | One / token-mean |
 | SDAR | Coefficient 0.01, beta 5.0, skill_all=false |
 | Interaction | 50 steps, history two, prompt 2048, response 512 |
@@ -57,13 +58,15 @@ Increasing GPU count does not increase the episode batch. Native decision-row
 batch adjustment is retained. Do not add an outer torchrun to this Ray launcher.
 
 This standalone release runs only the backbone selected in its README/shell
-entrypoints. Relative to the eight-GPU release e8d323f, the experiment JSON
-changes only trainer.n_gpus_per_node from eight to four. Resource validation,
-Ray GPU allocation, checkpoint rank-file checks and default GPU IDs also use
-four; the default CPU budget is 32. With configured global mini-batch256 and
-micro32/GPU, native gradient accumulation handles local64 rows per rank instead
-of local32 on eight ranks. Keep the native decision-row adjustment and loss
-aggregation; this is not a promise of bitwise eight-vs-four numerical identity.
+entrypoints. Relative to the preceding four-GPU 80GB release 9d1103d, exactly
+three experiment JSON fields change from 32 to 8: Actor PPO microbatch,
+Actor/Teacher log-prob microbatch, and reference log-prob microbatch. Four FSDP
+ranks, TP=2 and the default CPU budget of 32 remain fixed. With configured
+global mini-batch256 and micro8/GPU, native gradient accumulation handles
+local64 rows per rank with eight microbatches (4 * 8 * 8 = 256). Keep the
+native decision-row adjustment and token-mean loss aggregation. Microbatch
+partitioning and floating-point order differ, so this does not promise
+bitwise equality or identical token weighting across different microbatches.
 
 ## Necessary adaptations and what is not changed
 
@@ -74,12 +77,17 @@ aggregation; this is not a promise of bitwise eight-vs-four numerical identity.
    official launcher's 128 validation entries and five-update frequency.
    Task paths, game-file hashes, and seeds are included in the repository.
    This is a controlled comparison protocol, not a claim of identical paper scores.
-4. Every 16 independent native text environments share a Ray process. Each
-   environment retains its own seed/state; order and transitions are tested.
-   This is resource scheduling, not a change to observations/actions/rewards.
+4. Native environment concurrency is preserved: one Ray actor per text
+   environment, reserving 0.1 CPU. No extra serial worker pool is inserted.
 5. Local JSON metrics, task-level results, and checkpoint/export bookkeeping.
    Saves occur every 20 updates and at 150; native max_keep is set to two.
    This split does not replace upstream's checkpoint-rotation implementation.
+6. Three smaller per-device microbatches and a 40GB-class capacity preflight.
+   TP=2, vLLM memory utilization 0.6, CUDA graphs, cache settings, gradient
+   checkpointing and Actor/optimizer offload settings are unchanged. No
+   additional CPU offload, fused kernels, shorter sequences or smaller episode
+   batches are introduced. This is a hardware recipe, not a measured no-OOM
+   result; first-iteration GPU acceptance is still required.
 
 The native trainer's `fit`, Actor optimization, GRPO advantages, SDAR loss,
 Teacher construction, skill retrieval, observation prompts, action parser,
@@ -106,16 +114,20 @@ bash scripts/train.sh --dry-run
 ```
 
 Then check GPU ownership and available host RAM/disk. Use all four allocated
-80GB GPUs via `bash scripts/train.sh` in a persistent session. The compatibility
+40GB (or larger) GPUs via `bash scripts/train.sh` in a persistent session. The compatibility
 queue `scripts/run_both.sh` also runs only this repository's one selected size.
 Its first initial validation reports the untrained base performance.
 
 ## First real GPU iteration acceptance
 
 - Confirm four FSDP ranks, TP=2 rollout, and this repository's intended backbone.
+- Confirm at least 36GiB CUDA-visible capacity per GPU and sufficient free
+  memory; the capacity check alone cannot detect contention by other jobs.
 - Verify actual environment reset, generated action, execution and feedback.
 - Confirm finite rewards/advantages, Teacher log probabilities, Teacher gap
   and gate metrics, finite Actor gradient norm, and an actual parameter update.
+- Recheck memory after the first optimizer step and the next vLLM wake-up;
+  optimizer states are allocated lazily and initial validation is insufficient.
 - At the first save, verify all four model/optimizer/extra-state rank files
   plus Actor config and dataloader state. Missing ranks are not a resumable save.
 - At update150, export with the official model merger and preserve its hashes.
@@ -146,6 +158,9 @@ resuming; it rejects an eight-GPU run or a different recipe. It does not save
 the internal TextWorld environment iterator, so exact uninterrupted-versus-
 resumed rollout identity is not guaranteed. Interrupted writes are not valid
 checkpoints. A partial first save is not permission to restart automatically.
+The previous four-GPU 80GB recipe has a different configuration SHA too; do
+not bypass binding checks to resume it under this 40GB recipe. Start a new
+run directory and do not modify dependencies or settings in a live process.
 
 Each repository runs one size and requests native max_actor_ckpt_to_keep=2.
 Native retention is not a disk-wide transactional cleanup guarantee after

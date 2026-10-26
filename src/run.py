@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from common import ROOT, UPSTREAM, WORLD_SIZE, atomic_json, checkpoint_complete, devices, load, sha, tasks
+from common import ROOT, UPSTREAM, WORLD_SIZE, atomic_json, checkpoint_complete, devices, load, sha, tasks, validate_gpu_memory
 from setup import verify
 
 
@@ -120,12 +120,8 @@ def launch(args):
         data(run_dir)
     with run_lock(run_dir):
         import torch
-        if torch.cuda.device_count() != WORLD_SIZE:
-            raise RuntimeError('Four allocated CUDA devices are required')
-        for index in range(WORLD_SIZE):
-            props = torch.cuda.get_device_properties(index)
-            if props.total_memory < 70 * 1024**3:
-                raise RuntimeError('This recipe targets four A100 80GB GPUs')
+        validate_gpu_memory([torch.cuda.get_device_properties(index).total_memory
+                             for index in range(torch.cuda.device_count())])
         runtime = Path(tempfile.mkdtemp(prefix='sd-', dir=os.environ.get('SDAR_RUNTIME_ROOT')))
         cfg.ray_init._temp_dir = str(runtime)
         from omegaconf import OmegaConf
